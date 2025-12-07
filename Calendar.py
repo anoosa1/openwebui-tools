@@ -3,7 +3,7 @@ title: CalDAV Calendar & Tasks
 author: Anas Sherif
 email: anas@asherif.xyz
 date: 2025-12-07
-version: 1.0
+version: 1.1
 license: GPLv3
 description: Manage Events and Tasks (VTODO) via CalDAV. Supports creating, editing, completing tasks, and full time-range queries.
 """
@@ -113,16 +113,32 @@ class Tools:
         xml = """<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag /><c:calendar-data /></d:prop><c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT" /></c:comp-filter></c:filter></c:calendar-query>"""
         return self._extract(self._request("REPORT", self.valves.CALDAV_URL, data=xml, headers={"Depth":"1", "Content-Type":"application/xml; charset=utf-8"}))
 
-    def new_event(self, summary: str, start: str, end: str) -> str:
+    def new_event(self, start: str, end: str, event_data_json: str) -> str:
         """
         Create a new calendar event.
-        :param summary: The title/summary of the event.
         :param start: Start time in YYYYMMDDThhmmssZ format.
         :param end: End time in YYYYMMDDThhmmssZ format.
+        :param event_data_json: A JSON string of event fields (e.g. {"SUMMARY": "Title", "DESCRIPTION": "..."}).
         :return: Success message or error code.
         """
         uid = str(uuid.uuid4())
-        c = f"BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//AI Tool//EN\nBEGIN:VEVENT\nUID:{uid}\nDTSTAMP:{datetime.now().strftime('%Y%m%dT%H%M%SZ')}\nDTSTART:{start}\nDTEND:{end}\nSUMMARY:{summary}\nEND:VEVENT\nEND:VCALENDAR"
+        try:
+            fields = json.loads(event_data_json)
+        except Exception as e:
+            return f"Error parsing event_data_json: {str(e)}"
+
+        lines = [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//AI Tool//EN", "BEGIN:VEVENT",
+            f"UID:{uid}", f"DTSTAMP:{datetime.now().strftime('%Y%m%dT%H%M%SZ')}",
+            f"DTSTART:{start}", f"DTEND:{end}"
+        ]
+        for k, v in fields.items():
+            if isinstance(v, list):
+                for i in v: lines.append(f"{k}:{i}")
+            else:
+                lines.append(f"{k}:{v}")
+        lines.extend(["END:VEVENT", "END:VCALENDAR"])
+        c = "\n".join(lines)
         return self._handle_response(self._request("PUT", self._join_url(self.valves.CALDAV_URL, f"{uid}.ics"), data=c, headers={"Content-Type":"text/calendar"}))
 
     def read_event(self, filename: str) -> str:
@@ -151,9 +167,16 @@ class Tools:
     def delete_event(self, filename: str) -> str:
         """
         Delete an event.
+        IMPORTANT: You must use `search_events(query)` first to find the correct filename (UID.ics).
+        Do not guess the filename.
         :param filename: The filename (UID.ics) of the event to delete.
         :return: Success message or error code.
         """
+        # Verify existence first to prevent 404 errors on guessed filenames
+        check = self.read_event(filename)
+        if "Error" in check:
+            return f"Cannot delete: Event '{filename}' not found. Please use search_events() to find the correct filename/UID."
+
         return self._handle_response(self._request("DELETE", self._join_url(self.valves.CALDAV_URL, filename)))
 
     def search_events(self, query: str) -> str:
@@ -223,10 +246,10 @@ class Tools:
 # Usage
 # events = tools.get_events(start="20251201T000000Z", end="20251231T235959Z")
 # all_events = tools.get_all_events()
-# tools.new_event("Team Meeting", "20251208T090000Z", "20251208T100000Z")
-# details = tools.read_event("12345-uuid.ics")
-# tools.edit_event("12345-uuid.ics", '{"SUMMARY": "Rescheduled Meeting"}')
-# tools.delete_event("12345-uuid.ics")
+# tools.new_event("20251208T090000Z", "20251208T100000Z", '{"SUMMARY": "Team Meeting"}')
+# details = tools.read_event("uuid.ics")
+# tools.edit_event("uuid.ics", '{"SUMMARY": "Rescheduled Meeting"}')
+# tools.delete_event("uuid.ics")
 # search_result = tools.search_events("Project Launch")
 # tasks = tools.get_tasks()
 # tools.new_task("Buy groceries", due="20251208T180000Z")
