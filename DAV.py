@@ -3,7 +3,7 @@ title: DAV (WebDAV, CalDAV, CardDAV)
 author: Anas Sherif
 email: anas@asherif.xyz
 date: 2025-12-07
-version: 1.2
+version: 1.3
 license: GPLv3
 description: A comprehensive tool for OpenWebUI to manage files, calendars, and contacts using WebDAV, CalDAV, and CardDAV.
 """
@@ -53,8 +53,17 @@ class Tools:
 
     def _request(self, method: str, url: str, **kwargs):
         """
-        Wrapper for requests to handle retries.
+        Wrapper for requests to handle retries and validation.
         """
+        # 1. Validation: Check if URL is configured
+        if not url:
+            class ConfigErrorResponse:
+                status_code = 400
+                text = "Error: Configuration missing. Please set the URL (WEBDAV_BASE_URL, CALDAV_URL, or CARDDAV_URL) in the Tool Settings (Valves)."
+                content = text.encode('utf-8')
+            return ConfigErrorResponse()
+
+        # 2. Connection Logic
         try:
             retry_strategy = Retry(
                 total=self.valves.MAX_RETRIES,
@@ -218,7 +227,7 @@ class Tools:
         # 1. Determine URLs
         file_url = self.valves.WEBDAV_BASE_URL
         # specific logic to find the root DAV url for Nextcloud (remove /files/user)
-        if "/files/" in file_url:
+        if file_url and "/files/" in file_url:
             root_url = file_url.split("/files/")[0] + "/"
         else:
             root_url = file_url
@@ -266,9 +275,8 @@ class Tools:
              # Final Fallback: Manual client-side filtering
             try:
                 # If server search fails, list root files and filter (Depth 1 only)
-                # This prevents total failure but is limited in depth
                 all_files = self.list_files("") 
-                if "Error" in all_files: return f"Search failed: {response.status_code}"
+                if "Error" in all_files: return f"Search failed: {response.status_code} - {response.text}"
                 
                 lines = all_files.split('\n')
                 filtered = [line for line in lines if query.lower() in line.lower()]
