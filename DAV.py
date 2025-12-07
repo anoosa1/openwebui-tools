@@ -3,15 +3,16 @@ title: DAV (WebDAV, CalDAV, CardDAV)
 author: Anas Sherif
 email: anas@asherif.xyz
 date: 2025-12-07
-version: 1.3
+version: 1.4
 license: GPLv3
-description: A comprehensive tool for OpenWebUI to manage files, calendars, and contacts using WebDAV, CalDAV, and CardDAV.
+description: A comprehensive tool for OpenWebUI to manage files, calendars, and contacts using WebDAV, CalDAV, and CardDAV. Version 1.4 adds full read/edit access to all contact and event fields.
 """
 
 import requests
 import json
 import xml.etree.ElementTree as ET
 import uuid
+import re
 from datetime import datetime
 from typing import List, Dict, Optional, Union
 from urllib.parse import unquote
@@ -52,10 +53,7 @@ class Tools:
             return f"Error {response.status_code}"
 
     def _request(self, method: str, url: str, **kwargs):
-        """
-        Wrapper for requests to handle retries and validation.
-        """
-        # 1. Validation: Check if URL is configured
+        """Wrapper for requests to handle retries and validation."""
         if not url:
             class ConfigErrorResponse:
                 status_code = 400
@@ -63,7 +61,6 @@ class Tools:
                 content = text.encode('utf-8')
             return ConfigErrorResponse()
 
-        # 2. Connection Logic
         try:
             retry_strategy = Retry(
                 total=self.valves.MAX_RETRIES,
@@ -86,406 +83,288 @@ class Tools:
             return DummyResponse()
 
     # =========================================================================
-    # WEBDAV MODULE
+    # HELPERS
+    # =========================================================================
+
+    def _unfold_lines(self, text: str) -> List[str]:
+        """Unfolds lines (VCF/ICS line folding: lines starting with space are continuations)."""
+        lines = text.splitlines()
+        unfolded = []
+        for line in lines:
+            if line.startswith(" ") or line.startswith("\t"):
+                if unfolded:
+                    unfolded[-1] += line[1:]
+            else:
+                unfolded.append(line)
+        return unfolded
+
+    def _parse_dav_text(self, text: str) -> str:
+        """Generic parser for VCF/ICS that returns ALL fields."""
+        lines = self._unfold_lines(text)
+        data = {}
+        
+        for line in lines:
+            if ":" in line:
+                # Split Key and Value
+                # Handle grouping (e.g. item1.EMAIL:...) -> remove group
+                parts = line.split(":", 1)
+                key_part = parts[0]
+                value = parts[1]
+                
+                # Clean Key (remove parameters like ;TYPE=HOME)
+                key_raw = key_part.split(";")[0]
+                
+                # Remove grouping prefix if present (item1.ADR -> ADR)
+                if "." in key_raw:
+                    key_raw = key_raw.split(".")[-1]
+
+                # Store
+                if key_raw not in data:
+                    data[key_raw] = value
+                else:
+                    # Handle multiple values (e.g. multiple emails)
+                    if isinstance(data[key_raw], list):
+                        data[key_raw].append(value)
+                    else:
+                        data[key_raw] = [data[key_raw], value]
+        
+        return json.dumps(data)
+
+    def _apply_edits(self, original_text: str, updates: Dict[str, str]) -> str:
+        """
+        Smartly edits a VCF/ICS file.
+        1. Keeps lines that are NOT being updated (preserves photos, binary, etc).
+        2. Removes lines for keys that ARE being updated.
+        3. Appends the new values.
+        """
+        lines = self._unfold_lines(original_text)
+        new_lines = []
+        
+        # Keys to remove (normalized)
+        keys_to_update = set(updates.keys())
+        
+        for line in lines:
+            if ":" in line:
+                key_part = line.split(":", 1)[0]
+                key_raw = key_part.split(";")[0] # remove params
+                if "." in key_raw: key_raw = key_raw.split(".")[-1] # remove group
+                
+                # If this line's key is in our update list, SKIP it (we will replace it)
+                if key_raw in keys_to_update:
+                    continue
+            
+            # Keep line if not being updated
+            new_lines.append(line)
+        
+        # Insert new values before the END tag
+        end_tag = new_lines.pop() if new_lines and new_lines[-1].startswith("END:") else "END:VCARD"
+        
+        for key, value in updates.items():
+            # Handle list of values for a single key
+            if isinstance(value, list):
+                for v in value:
+                     new_lines.append(f"{key}:{v}")
+            else:
+                new_lines.append(f"{key}:{value}")
+                
+        new_lines.append(end_tag)
+        return "\n".join(new_lines)
+
+    # =========================================================================
+    # WEBDAV MODULE (Files)
     # =========================================================================
 
     def list_files(self, path: str = "") -> str:
-        """
-        List files and directories at the given path using WebDAV PROPFIND.
-        """
+        """List files and directories."""
         url = self._join_url(self.valves.WEBDAV_BASE_URL, path)
-        headers = {"Depth": "1"}
+        response = self._request("PROPFIND", url, headers={"Depth": "1"})
         
-        response = self._request("PROPFIND", url, headers=headers)
-        
-        if response.status_code >= 400:
-            return f"Error listing files: {response.status_code} - {response.text}"
+        if response.status_code >= 400: return f"Error: {response.status_code} - {response.text}"
         
         try:
             root = ET.fromstring(response.content)
             files = []
             ns = {'d': 'DAV:'}
-            for response_node in root.findall('.//d:response', ns):
-                href = response_node.find('.//d:href', ns).text
-                res_type = response_node.find('.//d:resourcetype', ns)
-                is_dir = res_type.find('.//d:collection', ns) is not None
+            for r in root.findall('.//d:response', ns):
+                href = unquote(r.find('.//d:href', ns).text)
+                is_dir = r.find('.//d:resourcetype/d:collection', ns) is not None
                 name = href.rstrip('/').split('/')[-1]
-                # Decode URL encoded names
-                name = unquote(name)
-                if name: 
-                    files.append(f"{'[DIR]' if is_dir else '[FILE]'} {name}")
+                if name: files.append(f"{'[DIR]' if is_dir else '[FILE]'} {name}")
             return "\n".join(files)
-        except Exception as e:
-            return f"Exception listing files: {str(e)}"
+        except Exception as e: return f"Exception: {str(e)}"
 
-    def create_directory(self, path: str) -> str:
-        """Create a new directory at the specified path."""
-        url = self._join_url(self.valves.WEBDAV_BASE_URL, path)
-        response = self._request("MKCOL", url)
-        return self._handle_response(response, [201])
-
-    def delete_directory(self, path: str) -> str:
-        """Delete a directory at the specified path."""
-        url = self._join_url(self.valves.WEBDAV_BASE_URL, path)
-        response = self._request("DELETE", url)
-        return self._handle_response(response, [204])
-
-    def create_file(self, path: str, content: str) -> str:
-        """Create a new file with text content at the specified path."""
-        url = self._join_url(self.valves.WEBDAV_BASE_URL, path)
-        response = self._request("PUT", url, data=content.encode('utf-8'))
-        return self._handle_response(response, [201, 204])
-
-    def delete_file(self, path: str) -> str:
-        """Delete a file at the specified path."""
-        url = self._join_url(self.valves.WEBDAV_BASE_URL, path)
-        response = self._request("DELETE", url)
-        return self._handle_response(response, [204])
-
+    def create_directory(self, path: str) -> str: return self._handle_response(self._request("MKCOL", self._join_url(self.valves.WEBDAV_BASE_URL, path)), [201])
+    def delete_directory(self, path: str) -> str: return self._handle_response(self._request("DELETE", self._join_url(self.valves.WEBDAV_BASE_URL, path)), [204])
+    def create_file(self, path: str, content: str) -> str: return self._handle_response(self._request("PUT", self._join_url(self.valves.WEBDAV_BASE_URL, path), data=content.encode('utf-8')), [201, 204])
+    def delete_file(self, path: str) -> str: return self._handle_response(self._request("DELETE", self._join_url(self.valves.WEBDAV_BASE_URL, path)), [204])
+    
     def read_file(self, path: str) -> str:
-        """Read the content of a text file."""
-        url = self._join_url(self.valves.WEBDAV_BASE_URL, path)
-        response = self._request("GET", url)
-        if response.status_code == 200:
-            return response.text
-        return f"Error reading file: {response.status_code} - {response.text}"
+        response = self._request("GET", self._join_url(self.valves.WEBDAV_BASE_URL, path))
+        return response.text if response.status_code == 200 else f"Error: {response.status_code}"
 
     def read_json_file(self, path: str) -> str:
-        """Read a JSON file and return its content as a stringified dictionary."""
-        content = self.read_file(path)
-        if content.startswith("Error"):
-            return content
-        try:
-            data = json.loads(content)
-            return json.dumps(data, indent=2)
-        except json.JSONDecodeError:
-            return "Error: File content is not valid JSON."
+        c = self.read_file(path)
+        try: return json.dumps(json.loads(c), indent=2)
+        except: return "Error: Invalid JSON"
 
     def write_json_file(self, path: str, data: str) -> str:
-        """Write a JSON string to a file."""
-        try:
-            # Validate JSON before writing
-            json_obj = json.loads(data)
-            content = json.dumps(json_obj, indent=2)
-            return self.create_file(path, content)
-        except json.JSONDecodeError:
-            return "Error: Input data is not valid JSON."
+        try: return self.create_file(path, json.dumps(json.loads(data), indent=2))
+        except: return "Error: Invalid JSON input"
 
-    def copy_file(self, source_path: str, dest_path: str) -> str:
-        """Copy a file from source to destination."""
-        url = self._join_url(self.valves.WEBDAV_BASE_URL, source_path)
-        dest_url = self._join_url(self.valves.WEBDAV_BASE_URL, dest_path)
-        headers = {"Destination": dest_url}
-        response = self._request("COPY", url, headers=headers)
-        return self._handle_response(response, [201, 204])
-
-    def move_file(self, source_path: str, dest_path: str) -> str:
-        """Move a file from source to destination."""
-        url = self._join_url(self.valves.WEBDAV_BASE_URL, source_path)
-        dest_url = self._join_url(self.valves.WEBDAV_BASE_URL, dest_path)
-        headers = {"Destination": dest_url}
-        response = self._request("MOVE", url, headers=headers)
-        return self._handle_response(response, [201, 204])
-
-    def copy_directory(self, source_path: str, dest_path: str) -> str:
-        """Copy a directory (and all contents) from source to destination."""
-        return self.copy_file(source_path, dest_path)
-
-    def move_directory(self, source_path: str, dest_path: str) -> str:
-        """Move a directory from source to destination."""
-        return self.move_file(source_path, dest_path)
-
-    def is_file(self, path: str) -> str:
-        """Check if a path exists and is a file."""
-        return self._check_resource_type(path, expect_collection=False)
-
-    def is_directory(self, path: str) -> str:
-        """Check if a path exists and is a directory."""
-        return self._check_resource_type(path, expect_collection=True)
-
-    def _check_resource_type(self, path, expect_collection):
-        url = self._join_url(self.valves.WEBDAV_BASE_URL, path)
-        headers = {"Depth": "0"}
-        response = self._request("PROPFIND", url, headers=headers)
-        if response.status_code >= 400:
-            return "False (Not found or error)"
-        
-        try:
-            root = ET.fromstring(response.content)
-            ns = {'d': 'DAV:'}
-            res_type = root.find('.//d:resourcetype', ns)
-            is_collection = res_type.find('.//d:collection', ns) is not None
-            return str(is_collection == expect_collection)
-        except:
-            return "False (Error parsing)"
-
+    def copy_file(self, src: str, dest: str) -> str: return self._handle_response(self._request("COPY", self._join_url(self.valves.WEBDAV_BASE_URL, src), headers={"Destination": self._join_url(self.valves.WEBDAV_BASE_URL, dest)}), [201, 204])
+    def move_file(self, src: str, dest: str) -> str: return self._handle_response(self._request("MOVE", self._join_url(self.valves.WEBDAV_BASE_URL, src), headers={"Destination": self._join_url(self.valves.WEBDAV_BASE_URL, dest)}), [201, 204])
+    
     def search_files(self, query: str) -> str:
-        """
-        Search for files containing the query string using WebDAV SEARCH (RFC 5323).
-        Automatically handles Nextcloud 501 errors by attempting search at Root DAV URL.
-        """
-        # 1. Determine URLs
+        """Search files (RFC 5323)."""
         file_url = self.valves.WEBDAV_BASE_URL
-        # specific logic to find the root DAV url for Nextcloud (remove /files/user)
-        if file_url and "/files/" in file_url:
-            root_url = file_url.split("/files/")[0] + "/"
-        else:
-            root_url = file_url
-
-        # 2. Define the Search Helper
-        def perform_search(target_url, search_scope):
-            xml_query = f"""<?xml version="1.0" encoding="UTF-8"?>
-            <d:searchrequest xmlns:d="DAV:">
-                <d:basicsearch>
-                    <d:select>
-                        <d:prop>
-                            <d:displayname/>
-                        </d:prop>
-                    </d:select>
-                    <d:from>
-                        <d:scope>
-                            <d:href>{search_scope}</d:href>
-                            <d:depth>infinity</d:depth>
-                        </d:scope>
-                    </d:from>
-                    <d:where>
-                        <d:like>
-                            <d:prop>
-                                <d:displayname/>
-                            </d:prop>
-                            <d:literal>%{query}%</d:literal>
-                        </d:like>
-                    </d:where>
-                </d:basicsearch>
-            </d:searchrequest>
-            """
-            headers = {"Content-Type": "text/xml"}
-            return self._request("SEARCH", target_url, data=xml_query, headers=headers)
-
-        # 3. Attempt Search on the configured File URL first
-        response = perform_search(file_url, file_url)
-
-        # 4. Fallback: If 501 (Not Implemented) or 404/405, try the Root DAV URL
-        if response.status_code in [501, 404, 405] and root_url != file_url:
-            # Search against ROOT, but scope to FILE URL
-            response = perform_search(root_url, file_url)
-
-        # 5. Process Response
-        if response.status_code >= 400:
-             # Final Fallback: Manual client-side filtering
-            try:
-                # If server search fails, list root files and filter (Depth 1 only)
-                all_files = self.list_files("") 
-                if "Error" in all_files: return f"Search failed: {response.status_code} - {response.text}"
-                
-                lines = all_files.split('\n')
-                filtered = [line for line in lines if query.lower() in line.lower()]
-                return "\n".join(filtered) if filtered else "No matches found (Client-side fallback)."
-            except:
-                return f"Search failed: {response.status_code} - {response.text}"
-
+        root_url = file_url.split("/files/")[0] + "/" if file_url and "/files/" in file_url else file_url
+        
+        xml_q = f"""<?xml version="1.0" encoding="UTF-8"?><d:searchrequest xmlns:d="DAV:"><d:basicsearch><d:select><d:prop><d:displayname/></d:prop></d:select><d:from><d:scope><d:href>{{}}</d:href><d:depth>infinity</d:depth></d:scope></d:from><d:where><d:like><d:prop><d:displayname/></d:prop><d:literal>%{query}%</d:literal></d:like></d:where></d:basicsearch></d:searchrequest>"""
+        
+        def do_search(u, s): return self._request("SEARCH", u, data=xml_q.format(s), headers={"Content-Type": "text/xml"})
+        
+        resp = do_search(file_url, file_url)
+        if resp.status_code in [501, 404, 405] and root_url != file_url: resp = do_search(root_url, file_url)
+        
+        if resp.status_code >= 400:
+            # Fallback
+            files = self.list_files("")
+            return "\n".join([l for l in files.split('\n') if query.lower() in l.lower()]) if "Error" not in files else f"Search Error: {resp.status_code}"
+            
         try:
-            root = ET.fromstring(response.content)
-            ns = {'d': 'DAV:'}
-            results = []
-            for response_node in root.findall('.//d:response', ns):
-                href = response_node.find('.//d:href', ns).text
-                # Decode URL-encoded filenames (e.g. %20 -> space)
-                readable_name = unquote(href)
-                results.append(readable_name)
-            return "\n".join(results) if results else "No matches found."
-        except Exception as e:
-            return f"Error parsing search results: {str(e)}"
+            root = ET.fromstring(resp.content)
+            return "\n".join([unquote(r.find('.//d:href', {'d':'DAV:'}).text) for r in root.findall('.//d:response', {'d':'DAV:'})]) or "No matches."
+        except Exception as e: return str(e)
 
     # =========================================================================
     # CALDAV MODULE
     # =========================================================================
 
-    def parse_ics_data(self, ics_text: str) -> str:
-        """Parses raw ICS text to return a readable summary."""
-        lines = ics_text.splitlines()
-        data = {}
-        for line in lines:
-            if ":" in line:
-                key, val = line.split(":", 1)
-                if key in ["SUMMARY", "DTSTART", "DTEND", "DESCRIPTION", "LOCATION"]:
-                    data[key] = val
-        return json.dumps(data)
-
     def get_events(self, start: str = None, end: str = None) -> str:
-        """
-        Get events in a time range. Dates must be YYYYMMDDThhmmssZ.
-        """
-        if not start:
-            start = datetime.now().strftime("%Y%m%dT%H%M%SZ")
-        if not end:
+        """Get events in range (YYYYMMDDThhmmssZ)."""
+        if not start: start = datetime.now().strftime("%Y%m%dT%H%M%SZ")
+        if not end: 
             from datetime import timedelta
             end = (datetime.now() + timedelta(days=30)).strftime("%Y%m%dT%H%M%SZ")
-
-        xml_query = f"""
-        <c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
-            <d:prop>
-                <d:getetag />
-                <c:calendar-data />
-            </d:prop>
-            <c:filter>
-                <c:comp-filter name="VCALENDAR">
-                    <c:comp-filter name="VEVENT">
-                        <c:time-range start="{start}" end="{end}"/>
-                    </c:comp-filter>
-                </c:comp-filter>
-            </c:filter>
-        </c:calendar-query>
-        """
-        headers = {"Depth": "1", "Content-Type": "application/xml; charset=utf-8"}
-        response = self._request("REPORT", self.valves.CALDAV_URL, data=xml_query, headers=headers)
-        
-        return self._extract_calendar_data(response)
+            
+        xml = f"""<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag /><c:calendar-data /></d:prop><c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT"><c:time-range start="{start}" end="{end}"/></c:comp-filter></c:comp-filter></c:filter></c:calendar-query>"""
+        return self._extract_calendar_data(self._request("REPORT", self.valves.CALDAV_URL, data=xml, headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"}))
 
     def get_all_events(self) -> str:
-        """Get all events from the calendar."""
-        xml_query = """
-        <c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
-            <d:prop>
-                <d:getetag />
-                <c:calendar-data />
-            </d:prop>
-            <c:filter>
-                <c:comp-filter name="VCALENDAR">
-                    <c:comp-filter name="VEVENT" />
-                </c:comp-filter>
-            </c:filter>
-        </c:calendar-query>
-        """
-        headers = {"Depth": "1", "Content-Type": "application/xml; charset=utf-8"}
-        response = self._request("REPORT", self.valves.CALDAV_URL, data=xml_query, headers=headers)
-        return self._extract_calendar_data(response)
+        xml = """<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag /><c:calendar-data /></d:prop><c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT" /></c:comp-filter></c:filter></c:calendar-query>"""
+        return self._extract_calendar_data(self._request("REPORT", self.valves.CALDAV_URL, data=xml, headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"}))
 
     def _extract_calendar_data(self, response):
-        if response.status_code >= 400:
-            return f"Error fetching events: {response.status_code} - {response.text}"
-        
+        if response.status_code >= 400: return f"Error: {response.status_code}"
         try:
             root = ET.fromstring(response.content)
-            events = []
-            for node in root.findall(".//{urn:ietf:params:xml:ns:caldav}calendar-data"):
-                events.append(self.parse_ics_data(node.text))
-            return str(events)
-        except Exception as e:
-            return f"Error parsing XML: {str(e)}"
+            # Use the new generic parser for every event found
+            return str([self._parse_dav_text(node.text) for node in root.findall(".//{urn:ietf:params:xml:ns:caldav}calendar-data")])
+        except Exception as e: return str(e)
 
-    def new_event(self, summary: str, start_time: str, end_time: str) -> str:
-        """Create a new event."""
-        uid = str(uuid.uuid4())
-        ics_content = f"""BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//OpenWebUI//Tool//EN
-BEGIN:VEVENT
-UID:{uid}
-DTSTAMP:{datetime.now().strftime("%Y%m%dT%H%M%SZ")}
-DTSTART:{start_time}
-DTEND:{end_time}
-SUMMARY:{summary}
-END:VEVENT
-END:VCALENDAR"""
+    def read_event(self, filename: str) -> str:
+        """Reads a specific event file and returns all fields as JSON."""
+        url = self._join_url(self.valves.CALDAV_URL, filename)
+        response = self._request("GET", url)
+        if response.status_code != 200: return f"Error: {response.status_code}"
+        return self._parse_dav_text(response.text)
+
+    def edit_event(self, filename: str, updates_json: str) -> str:
+        """
+        Edit an event. 
+        Args:
+            filename: The UID.ics filename.
+            updates_json: JSON string of fields to update (e.g. '{"SUMMARY": "New Title", "DESCRIPTION": "Notes"}').
+        """
+        url = self._join_url(self.valves.CALDAV_URL, filename)
         
-        url = self._join_url(self.valves.CALDAV_URL, f"{uid}.ics")
-        response = self._request("PUT", url, data=ics_content, headers={"Content-Type": "text/calendar"})
-        return self._handle_response(response, [201, 204])
+        # 1. Get Existing
+        response = self._request("GET", url)
+        if response.status_code != 200: return f"Error reading event: {response.status_code}"
+        original_text = response.text
+
+        # 2. Apply Edits
+        try:
+            updates = json.loads(updates_json)
+            new_content = self._apply_edits(original_text, updates)
+        except Exception as e:
+            return f"Error processing updates: {str(e)}"
+
+        # 3. Save
+        put_resp = self._request("PUT", url, data=new_content.encode('utf-8'), headers={"Content-Type": "text/calendar"})
+        return self._handle_response(put_resp, [201, 204])
+
+    def new_event(self, summary: str, start: str, end: str) -> str:
+        uid = str(uuid.uuid4())
+        content = f"BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//AI Tool//EN\nBEGIN:VEVENT\nUID:{uid}\nDTSTAMP:{datetime.now().strftime('%Y%m%dT%H%M%SZ')}\nDTSTART:{start}\nDTEND:{end}\nSUMMARY:{summary}\nEND:VEVENT\nEND:VCALENDAR"
+        return self._handle_response(self._request("PUT", self._join_url(self.valves.CALDAV_URL, f"{uid}.ics"), data=content, headers={"Content-Type": "text/calendar"}), [201, 204])
 
     def delete_event(self, filename: str) -> str:
-        """Delete an event by its filename."""
-        url = self._join_url(self.valves.CALDAV_URL, filename)
-        response = self._request("DELETE", url)
-        return self._handle_response(response)
+        return self._handle_response(self._request("DELETE", self._join_url(self.valves.CALDAV_URL, filename)))
 
     def search_events(self, query: str) -> str:
-        """Fetches all events and filters them (case-insensitive)."""
-        all_events_str = self.get_all_events()
-        import ast
+        all_ev = self.get_all_events()
         try:
-            events = ast.literal_eval(all_events_str)
-            matches = []
-            query_lower = query.lower()
-            for event_str in events:
-                event = json.loads(event_str)
-                if any(query_lower in str(v).lower() for v in event.values()):
-                    matches.append(event)
-            return str(matches)
-        except:
-            return "Error processing events for search."
+            # Basic text search on the JSON string representation
+            events = [json.loads(e) for e in eval(all_ev)]
+            return json.dumps([e for e in events if any(query.lower() in str(v).lower() for v in e.values())])
+        except: return "Search Error"
 
     # =========================================================================
     # CARDDAV MODULE
     # =========================================================================
 
-    def parse_vcf_data(self, vcf_text: str) -> str:
-        """Parses raw VCF text to return key contact info."""
-        lines = vcf_text.splitlines()
-        data = {}
-        for line in lines:
-            if ":" in line:
-                parts = line.split(":", 1)
-                key_raw = parts[0].split(";")[0]
-                val = parts[1]
-                if key_raw in ["FN", "EMAIL", "TEL", "N", "ORG"]:
-                    if key_raw not in data:
-                        data[key_raw] = val
-                    else:
-                        data[key_raw] += f", {val}"
-        return json.dumps(data)
+    def read_contact(self, filename: str) -> str:
+        """Reads a specific contact file and returns ALL fields as JSON."""
+        url = self._join_url(self.valves.CARDDAV_URL, filename)
+        response = self._request("GET", url)
+        if response.status_code != 200: return f"Error: {response.status_code}"
+        return self._parse_dav_text(response.text)
+
+    def edit_contact(self, filename: str, updates_json: str) -> str:
+        """
+        Edit a contact.
+        Args:
+            filename: The UID.vcf filename.
+            updates_json: JSON string of fields to update (e.g. '{"FN": "New Name", "EMAIL": "new@mail.com"}').
+        """
+        url = self._join_url(self.valves.CARDDAV_URL, filename)
+        
+        # 1. Get Existing
+        response = self._request("GET", url)
+        if response.status_code != 200: return f"Error reading contact: {response.status_code}"
+        original_text = response.text
+
+        # 2. Apply Edits
+        try:
+            updates = json.loads(updates_json)
+            new_content = self._apply_edits(original_text, updates)
+        except Exception as e:
+            return f"Error processing updates: {str(e)}"
+
+        # 3. Save
+        put_resp = self._request("PUT", url, data=new_content.encode('utf-8'), headers={"Content-Type": "text/vcard"})
+        return self._handle_response(put_resp, [201, 204])
 
     def new_contact(self, fn: str, email: str, tel: str = "") -> str:
-        """Create a new contact."""
         uid = str(uuid.uuid4())
-        vcf_content = f"""BEGIN:VCARD
-VERSION:3.0
-PRODID:-//OpenWebUI//Tool//EN
-UID:{uid}
-FN:{fn}
-EMAIL:{email}
-TEL:{tel}
-END:VCARD"""
-        
-        url = self._join_url(self.valves.CARDDAV_URL, f"{uid}.vcf")
-        response = self._request("PUT", url, data=vcf_content, headers={"Content-Type": "text/vcard"})
-        return self._handle_response(response, [201, 204])
+        content = f"BEGIN:VCARD\nVERSION:3.0\nPRODID:-//AI Tool//EN\nUID:{uid}\nFN:{fn}\nEMAIL:{email}\nTEL:{tel}\nEND:VCARD"
+        return self._handle_response(self._request("PUT", self._join_url(self.valves.CARDDAV_URL, f"{uid}.vcf"), data=content, headers={"Content-Type": "text/vcard"}), [201, 204])
 
     def delete_contact(self, filename: str) -> str:
-        """Delete a contact by filename."""
-        url = self._join_url(self.valves.CARDDAV_URL, filename)
-        response = self._request("DELETE", url)
-        return self._handle_response(response)
+        return self._handle_response(self._request("DELETE", self._join_url(self.valves.CARDDAV_URL, filename)))
 
     def search_contacts(self, query: str) -> str:
-        """Fetches all contacts and searches for the query string."""
-        xml_query = """
-        <c:addressbook-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav">
-            <d:prop>
-                <d:getetag />
-                <c:address-data />
-            </d:prop>
-            <c:filter>
-                <c:prop-filter name="FN"/> 
-            </c:filter>
-        </c:addressbook-query>
-        """
-        headers = {"Depth": "1", "Content-Type": "application/xml; charset=utf-8"}
-        response = self._request("REPORT", self.valves.CARDDAV_URL, data=xml_query, headers=headers)
-        
-        if response.status_code >= 400:
-            return f"Error fetching contacts: {response.status_code} - {response.text}"
-
+        xml = """<c:addressbook-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:prop><d:getetag /><c:address-data /></d:prop><c:filter><c:prop-filter name="FN"/></c:filter></c:addressbook-query>"""
+        resp = self._request("REPORT", self.valves.CARDDAV_URL, data=xml, headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"})
+        if resp.status_code >= 400: return f"Error: {resp.status_code}"
         try:
-            root = ET.fromstring(response.content)
+            root = ET.fromstring(resp.content)
+            # Use generic parser to search all fields
             matches = []
-            query_lower = query.lower()
-            
+            q = query.lower()
             for node in root.findall(".//{urn:ietf:params:xml:ns:carddav}address-data"):
-                vcf_text = node.text
-                if query_lower in vcf_text.lower():
-                    matches.append(self.parse_vcf_data(vcf_text))
-            
-            return str(matches) if matches else "No contacts found matching query."
-        except Exception as e:
-            return f"Error parsing contacts: {str(e)}"
+                data = self._parse_dav_text(node.text)
+                if q in data.lower(): matches.append(data)
+            return str(matches) if matches else "No matches."
+        except Exception as e: return str(e)
