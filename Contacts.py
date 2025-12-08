@@ -3,7 +3,7 @@ title: CardDAV Contacts
 author: Anas Sherif
 email: anas@asherif.xyz
 date: 2025-12-07
-version: 1.1
+version: 1.2
 license: GPLv3
 description: Manage Contacts via CardDAV. Search, create, and edit contact details with full field access.
 """
@@ -130,19 +130,37 @@ class Tools:
         except Exception as e: return str(e)
         return self._handle_response(self._request("PUT", url, data=new_c.encode('utf-8'), headers={"Content-Type":"text/vcard"}))
 
-    def delete_contact(self, filename: str) -> str:
+    def delete_contact(self, query: str) -> str:
         """
-        Delete a contact.
-        :param filename: The filename (UID.vcf) of the contact to delete.
+        Delete a contact by searching for it first.
+        :param query: The text to search for (e.g. Name). Fails if multiple matches are found.
         :return: Success message or error code.
         """
-        return self._handle_response(self._request("DELETE", self._join_url(self.valves.CARDDAV_URL, filename)))
+        # 1. Search
+        search_res = self.search_contacts(query)
+        if search_res == "No matches.": return "Error: Contact not found."
+        
+        try:
+            # 2. Parse matches
+            matches = json.loads(search_res)
+            if len(matches) > 1:
+                return f"Error: Ambiguous query. Found {len(matches)} matches. Please be more specific."
+            
+            # 3. Get UID from the single match
+            contact = json.loads(matches[0])
+            uid = contact.get("UID")
+            if not uid: return "Error: Contact data corrupted (No UID)."
+            
+            # 4. Delete
+            return self._handle_response(self._request("DELETE", self._join_url(self.valves.CARDDAV_URL, f"{uid}.vcf")))
+        except Exception as e:
+            return f"Error processing deletion: {str(e)}"
 
     def search_contacts(self, query: str) -> str:
         """
         Search for contacts matching a query.
         :param query: The text to search for (e.g. name or email).
-        :return: A list of matching contacts.
+        :return: A JSON list of matching contacts (as JSON strings).
         """
         xml = """<c:addressbook-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:prop><d:getetag /><c:address-data /></d:prop><c:filter><c:prop-filter name="FN"/></c:filter></c:addressbook-query>"""
         resp = self._request("REPORT", self.valves.CARDDAV_URL, data=xml, headers={"Depth":"1", "Content-Type":"application/xml; charset=utf-8"})
@@ -154,12 +172,12 @@ class Tools:
             for node in root.findall(".//{urn:ietf:params:xml:ns:carddav}address-data"):
                 data = self._parse_dav(node.text)
                 if q in data.lower(): matches.append(data)
-            return str(matches) if matches else "No matches."
+            return json.dumps(matches) if matches else "No matches."
         except Exception as e: return str(e)
 
 # Usage
 # contact_info = tools.read_contact("uuid.vcf")
 # tools.new_contact('{"FN": "Alice Smith", "EMAIL": "alice@example.com", "TEL": "555-0101"}')
 # tools.edit_contact("uuid.vcf", '{"TEL": "555-0102", "ORG": "New Company"}')
-# tools.delete_contact("uuid.vcf")
+# tools.delete_contact("Alice Smith")
 # results = tools.search_contacts("Alice")
