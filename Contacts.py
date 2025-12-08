@@ -3,7 +3,7 @@ title: CardDAV Contacts
 author: Anas Sherif
 email: anas@asherif.xyz
 date: 2025-12-07
-version: 1.0
+version: 1.1
 license: GPLv3
 description: Manage Contacts via CardDAV. Search, create, and edit contact details with full field access.
 """
@@ -98,17 +98,23 @@ class Tools:
         resp = self._request("GET", self._join_url(self.valves.CARDDAV_URL, filename))
         return self._parse_dav(resp.text) if resp.status_code == 200 else f"Error: {resp.status_code}"
 
-    def new_contact(self, fn: str, email: str, tel: str = "") -> str:
+    def new_contact(self, contact_json: str) -> str:
         """
         Create a new contact.
-        :param fn: Full Name of the contact.
-        :param email: Email address.
-        :param tel: Telephone number (optional).
+        :param contact_json: JSON string of fields (e.g. {"FN": "Name", "EMAIL": "e@mail.com"}).
         :return: Success message or error code.
         """
+        try: data = json.loads(contact_json)
+        except: return "Error: Invalid JSON"
+
         uid = str(uuid.uuid4())
-        c = f"BEGIN:VCARD\nVERSION:3.0\nPRODID:-//AI Tool//EN\nUID:{uid}\nFN:{fn}\nEMAIL:{email}\nTEL:{tel}\nEND:VCARD"
-        return self._handle_response(self._request("PUT", self._join_url(self.valves.CARDDAV_URL, f"{uid}.vcf"), data=c, headers={"Content-Type":"text/vcard"}))
+        lines = ["BEGIN:VCARD", "VERSION:3.0", "PRODID:-//AI Tool//EN", f"UID:{uid}"]
+        for k, v in data.items():
+            if isinstance(v, list):
+                for i in v: lines.append(f"{k}:{i}")
+            else: lines.append(f"{k}:{v}")
+        lines.append("END:VCARD")
+        return self._handle_response(self._request("PUT", self._join_url(self.valves.CARDDAV_URL, f"{uid}.vcf"), data="\n".join(lines), headers={"Content-Type":"text/vcard"}))
 
     def edit_contact(self, filename: str, updates_json: str) -> str:
         """
@@ -153,7 +159,7 @@ class Tools:
 
 # Usage
 # contact_info = tools.read_contact("uuid.vcf")
-# tools.new_contact("Alice Smith", "alice@example.com", "555-0101")
+# tools.new_contact('{"FN": "Alice Smith", "EMAIL": "alice@example.com", "TEL": "555-0101"}')
 # tools.edit_contact("uuid.vcf", '{"TEL": "555-0102", "ORG": "New Company"}')
 # tools.delete_contact("uuid.vcf")
 # results = tools.search_contacts("Alice")
